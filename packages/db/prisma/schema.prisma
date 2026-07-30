@@ -1,0 +1,387 @@
+// =============================================================================
+// AR QUDRIX — Core Database Schema
+// Provider: PostgreSQL (Neon, external managed — reachable from Hostinger Node app)
+// ORM: Prisma
+//
+// Domain-Driven Design boundaries in this file:
+//   - Identity & Access   (User, Role, Session, Account)
+//   - Business Registry   (Business, BusinessTranslation, BusinessStatusLog)
+//   - Lead Generation     (Lead, Inquiry)
+//   - Content             (Page, BlogPost, BlogPostTranslation, Media)
+//   - Governance           (AuditLog)
+//
+// Multi-tenant isolation strategy: single-tenant today (AR Qudrix only).
+// `tenantId` columns are included now on tenant-scoped tables so that
+// Postgres Row-Level Security (RLS) policies can be enabled later without
+// a schema migration when sub-business portals are onboarded (see ADR-003).
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// IDENTITY & ACCESS (Auth.js compatible + custom RBAC)
+// -----------------------------------------------------------------------------
+
+enum UserRole {
+  PUBLIC_USER
+  CUSTOMER
+  CLIENT
+  PARTNER
+  SUPPLIER
+  INVESTOR
+  EMPLOYEE
+  MANAGER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+model User {
+  id            String     @id @default(cuid())
+  tenantId      String     @default("arqudrix-core")
+  email         String     @unique
+  emailVerified DateTime?
+  passwordHash  String?
+  fullName      String
+  role          UserRole   @default(PUBLIC_USER)
+  status        UserStatus @default(PENDING_VERIFICATION)
+  avatarUrl     String?
+  locale        String     @default("en")
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  lastLoginAt   DateTime?
+
+  accounts      Account[]
+  sessions      Session[]
+  inquiries     Inquiry[]
+  auditLogs     AuditLog[]
+  authoredPosts BlogPost[]
+
+  @@index([tenantId, role])
+  @@index([email])
+  @@map("users")
+}
+
+// Auth.js (NextAuth v5) required adapter models
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// -----------------------------------------------------------------------------
+// BUSINESS REGISTRY (admin-managed "Products / Businesses" — powers the card grid)
+// -----------------------------------------------------------------------------
+
+enum BusinessStatus {
+  ACTIVE
+  IN_DEVELOPMENT
+  PLANNED
+  ARCHIVED
+}
+
+enum BusinessCategory {
+  ECOMMERCE
+  AGENCY
+  AGRICULTURE
+  AI_TECHNOLOGY
+  ENTERPRISE_PLATFORM
+  TRAVEL
+  REAL_ESTATE
+  MEDIA
+  OTHER
+}
+
+// One row per product/business shown as a card on /businesses.
+// Admin has full CRUD control end-to-end — no hardcoded frontend data.
+model Business {
+  id          String           @id @default(cuid())
+  tenantId    String           @default("arqudrix-core")
+  slug        String           @unique // used for /businesses/[slug]
+  category    BusinessCategory
+  status      BusinessStatus   @default(PLANNED)
+  logoUrl     String?
+  coverImageUrl String?
+  websiteUrl  String? // external link, if the business has its own dedicated app/domain
+  displayOrder Int             @default(0) // controls card grid ordering, admin-editable
+  isFeatured  Boolean          @default(false)
+  launchedAt  DateTime? // null until status becomes ACTIVE
+
+  translations BusinessTranslation[]
+  statusLogs   BusinessStatusLog[]
+  leads        Lead[]
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([tenantId, status])
+  @@index([displayOrder])
+  @@map("businesses")
+}
+
+// Locale-specific content — required for EN/AR parity (never a raw mirror; each
+// locale row is independently authored/translated content).
+model BusinessTranslation {
+  id          String   @id @default(cuid())
+  businessId  String
+  locale      String // "en" | "ar"
+  name        String
+  tagline     String // one-line, used on the card
+  description String   @db.Text // full landing-page body
+  metaTitle   String?
+  metaDescription String?
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([businessId, locale])
+  @@map("business_translations")
+}
+
+// Immutable audit trail of every status change (ACTIVE/IN_DEVELOPMENT/PLANNED/ARCHIVED)
+// so the public site never silently claims a business is active without a record.
+model BusinessStatusLog {
+  id          String         @id @default(cuid())
+  businessId  String
+  fromStatus  BusinessStatus?
+  toStatus    BusinessStatus
+  changedById String
+  reason      String?
+  createdAt   DateTime       @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("business_status_logs")
+}
+
+// -----------------------------------------------------------------------------
+// LEAD GENERATION (Contact form → this table → future ARQ OS CRM sync via BFF)
+// -----------------------------------------------------------------------------
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  CONVERTED
+  ARCHIVED
+  SPAM
+}
+
+model Lead {
+  id          String     @id @default(cuid())
+  tenantId    String     @default("arqudrix-core")
+  fullName    String
+  email       String
+  phone       String?
+  company     String?
+  message     String     @db.Text
+  businessId  String? // which product/business card the inquiry originated from, if any
+  locale      String     @default("en")
+  status      LeadStatus @default(NEW)
+  source      String     @default("website_contact_form")
+  ipHash      String? // hashed, never raw IP (privacy)
+  arqOsSyncedAt DateTime? // null until ARQ OS CRM sync succeeds (Phase 7)
+
+  business Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, status])
+  @@index([createdAt])
+  @@map("leads")
+}
+
+enum InquiryType {
+  SUPPORT
+  PROJECT
+  PARTNERSHIP
+  GENERAL
+}
+
+enum InquiryStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+// Client portal inquiries — distinct from anonymous public Leads, always tied to a User.
+model Inquiry {
+  id        String        @id @default(cuid())
+  tenantId  String        @default("arqudrix-core")
+  userId    String
+  type      InquiryType
+  status    InquiryStatus @default(OPEN)
+  subject   String
+  body      String        @db.Text
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, userId])
+  @@map("inquiries")
+}
+
+// -----------------------------------------------------------------------------
+// CONTENT (Blog / static pages — internal CMS, admin-managed)
+// -----------------------------------------------------------------------------
+
+enum ContentStatus {
+  DRAFT
+  IN_REVIEW
+  PUBLISHED
+  UNPUBLISHED
+}
+
+model BlogPost {
+  id           String        @id @default(cuid())
+  tenantId     String        @default("arqudrix-core")
+  slug         String        @unique
+  status       ContentStatus @default(DRAFT)
+  coverImageUrl String?
+  authorId     String
+  publishedAt  DateTime?
+
+  translations BlogPostTranslation[]
+  author       User @relation(fields: [authorId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, status])
+  @@map("blog_posts")
+}
+
+model BlogPostTranslation {
+  id              String   @id @default(cuid())
+  blogPostId      String
+  locale          String
+  title           String
+  excerpt         String
+  body            String   @db.Text
+  metaTitle       String?
+  metaDescription String?
+
+  blogPost BlogPost @relation(fields: [blogPostId], references: [id], onDelete: Cascade)
+
+  @@unique([blogPostId, locale])
+  @@map("blog_post_translations")
+}
+
+model Media {
+  id        String   @id @default(cuid())
+  tenantId  String   @default("arqudrix-core")
+  url       String
+  altText   String?
+  mimeType  String
+  sizeBytes Int
+  uploadedById String
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@map("media")
+}
+
+// -----------------------------------------------------------------------------
+// INTEGRATION SETTINGS (runtime-configurable from Admin → Integrations —
+// Meta Pixel / Google Ads IDs are NOT baked into env vars at build time, so
+// marketing can rotate them without a redeploy. Singleton row per tenant.)
+// -----------------------------------------------------------------------------
+
+model IntegrationSettings {
+  id       String @id @default(cuid())
+  tenantId String @unique @default("arqudrix-core")
+
+  metaPixelEnabled Boolean @default(false)
+  metaPixelId      String?
+
+  googleAdsEnabled              Boolean @default(false)
+  googleAdsId                   String? // format: AW-XXXXXXXXX
+  googleAdsLeadConversionLabel  String?
+  googleAdsRegistrationConversionLabel String?
+
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@map("integration_settings")
+}
+
+// -----------------------------------------------------------------------------
+// GOVERNANCE (mandatory per master prompt §7 — every sensitive admin action logged)
+// -----------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  tenantId   String   @default("arqudrix-core")
+  actorId    String?
+  action     String // e.g. "business.status_changed", "lead.deleted"
+  entityType String // e.g. "Business", "Lead", "User"
+  entityId   String?
+  metadata   Json? // structured before/after diff
+  ipHash     String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
